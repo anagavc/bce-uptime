@@ -1,0 +1,93 @@
+name: Uptime
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+permissions:
+  contents: write
+concurrency:
+  group: uptime
+  cancel-in-progress: false
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Probe the health endpoint (3 attempts)
+        id: probe
+        run: |
+          URL="https://web-production-d8945.up.railway.app/api/v1/health"
+          up=0; detail=""
+          for i in 1 2 3; do
+            code=$(curl -sS -o /tmp/body -w '%{http_code}' --max-time 15 "$URL" 2>/tmp/err || true)
+            if [ "$code" = "200" ] && grep -q '"status":"healthy"' /tmp/body; then up=1; break; fi
+            detail="attempt $i: HTTP ${code:-0} $(cat /tmp/err /tmp/body 2>/dev/null | head -c 160 | tr '\n' ' ')"
+            [ "$i" -lt 3 ] && sleep 20
+          done
+          echo "up=$up" >> "$GITHUB_OUTPUT"
+          echo "detail=$detail" >> "$GITHUB_OUTPUT"
+          echo "probe result: up=$up $detail"
+
+      - name: Compare with the last state and alert
+        env:
+          RESEND_API_KEY: ${{ secrets.RESEND_API_KEY }}
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          ALERT_EMAIL: ${{ secrets.ALERT_EMAIL }}
+          UP: ${{ steps.probe.outputs.up }}
+          DETAIL: ${{ steps.probe.outputs.detail }}
+        run: |
+          set -e
+          now=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          nowS=$(date -u +%s)
+          prev=$(jq -r '.status // "unknown"' state.json)
+          since=$(jq -r '.since // ""' state.json)
+          lastAlert=$(jq -r '.lastAlert // ""' state.json)
+          cur=$([ "$UP" = "1" ] && echo up || echo down)
+
+          send() {  # subject, html
+            curl -sS -X POST https://api.resend.com/emails \
+              -H "Authorization: Bearer $RESEND_API_KEY" -H 'Content-Type: application/json' \
+              -d "$(jq -n --arg from "$EMAIL_FROM" --arg to "$ALERT_EMAIL" --arg s "$1" --arg h "$2" \
+                    '{from:$from,to:[$to],subject:$s,html:$h}')" >/dev/null
+            echo "sent: $1"
+          }
+          minutesBetween() { echo $(( ( $(date -u -d "$2" +%s) - $(date -u -d "$1" +%s) ) / 60 )); }
+          write_state() { jq -n --arg s "$1" --arg t "$2" --arg a "$3" '{status:$s,since:$t,lastAlert:$a}' > state.json; }
+          commit() {
+            git config user.name "bce-uptime"; git config user.email "uptime@users.noreply.github.com"
+            git add state.json; git commit -q -m "$1" && git push -q
+          }
+
+          if [ "$cur" != "$prev" ]; then
+            if [ "$cur" = "down" ]; then
+              send "[BCE critical] API is DOWN" "<p>The Bring Cargo Express API stopped answering its health check at <b>$now</b> (UTC).</p><p>Last probe: $DETAIL</p><p>Checked from GitHub Actions, outside the hosting provider. Open the Railway dashboard: deployment logs and a restart are the first things to try. A reminder follows every hour until it is back.</p>"
+              write_state down "$now" "$now"
+              commit "DOWN at $now"
+            elif [ "$prev" = "down" ]; then
+              mins=$(minutesBetween "$since" "$now")
+              send "[BCE info] API is back up after ${mins} min" "<p>The API answered its health check again at <b>$now</b> (UTC) after being down since $since (about ${mins} minutes).</p>"
+              write_state up "$now" "$now"
+              commit "UP at $now after ${mins} min"
+            else
+              send "[BCE info] Uptime monitor started" "<p>External uptime monitoring of the Bring Cargo Express API started at <b>$now</b> (UTC). The health endpoint is probed every five minutes; you will be emailed when it goes down and when it comes back.</p>"
+              write_state up "$now" "$now"
+              commit "monitor started $now"
+            fi
+          else
+            if [ "$cur" = "down" ] && [ $(minutesBetween "$lastAlert" "$now") -ge 60 ]; then
+              mins=$(minutesBetween "$since" "$now")
+              send "[BCE critical] API still DOWN (${mins} min)" "<p>The API has not answered its health check since <b>$since</b> (UTC), about ${mins} minutes.</p><p>Last probe: $DETAIL</p>"
+              write_state down "$since" "$now"
+              commit "still down at $now"
+            else
+              # Weekly heartbeat commit so GitHub never disables the schedule for inactivity.
+              last=$(git log -1 --format=%ct)
+              if [ $(( nowS - last )) -gt 604800 ]; then
+                write_state "$cur" "$since" "$lastAlert"; echo "" >> state.json
+                commit "heartbeat $now"
+              fi
+            fi
+          fi
+          echo "state: $cur (was $prev)"
